@@ -641,6 +641,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     plan.vertices.clear();
     plan.indices.clear();
   }
+  plan.display_list_address = draw.display_list_address;
   plan.match_payload = draw.vertex_payload.data();
   plan.match_payload_size = static_cast<std::uint32_t>(draw.vertex_payload.size());
   plan.match_primitive = draw.primitive;

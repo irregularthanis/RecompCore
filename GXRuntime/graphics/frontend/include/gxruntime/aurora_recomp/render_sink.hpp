@@ -100,6 +100,10 @@ struct RenderResourcePacket {
 };
 
 struct RenderDrawPacket {
+  // Guest address of the display list that contained this draw command.
+  // Zero identifies a draw parsed directly from the live FIFO or a caller
+  // that did not provide a display-list identity.
+  std::uint32_t display_list_address = 0;
   std::uint32_t primitive = 0;
   std::uint32_t vtx_fmt = 0;
   std::uint32_t vertex_count = 0;
@@ -246,6 +250,7 @@ struct ConsumedDraw {
   static constexpr std::uint32_t kMaxArrays = 16u;
 
   std::uint64_t sequence = 0;
+  std::uint32_t display_list_address = 0;
   std::uint32_t primitive = 0;
   std::uint32_t vtx_fmt = 0;
   std::uint32_t vertex_count = 0;

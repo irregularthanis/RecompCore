@@ -228,6 +228,10 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
         if (draw.segments.empty())
           draw.segments.push_back((draw.primitive << 16) | draw.vertex_count);
         draw.segments.push_back((packet.draw.primitive << 16) | packet.draw.vertex_count);
+        // A fused plan spanning different lists has no single list identity.
+        // Preserve rendering and report it in the unknown attribution bucket.
+        if (draw.display_list_address != packet.draw.display_list_address)
+          draw.display_list_address = 0u;
         draw.vertex_count += packet.draw.vertex_count;
         draw.vertex_payload.insert(draw.vertex_payload.end(), packet.draw.vertex_payload,
                                    packet.draw.vertex_payload + bytes);
@@ -276,6 +280,7 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
     }
     ConsumedDraw& draw = *slot;
     draw.sequence = packet.sequence;
+    draw.display_list_address = packet.draw.display_list_address;
     draw.primitive = packet.draw.primitive;
     draw.vtx_fmt = packet.draw.vtx_fmt;
     draw.vertex_count = packet.draw.vertex_count;

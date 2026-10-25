@@ -82,6 +82,8 @@ typedef struct DolAuroraRecompRenderResourcePacket {
 } DolAuroraRecompRenderResourcePacket;
 
 typedef struct DolAuroraRecompRenderDrawPacket {
+    /* Guest display-list address; zero for direct FIFO or unknown origin. */
+    u32 display_list_address;
     u32 primitive;
     u32 vtx_fmt;
     u32 vertex_count;
