@@ -487,6 +487,9 @@ static_assert(sizeof(ConstantsInputs) == 8 + 9 * 4 + 5 + 7);
 struct DrawPlanFields {
   bool ok = false;
   const char* skip_reason = nullptr; // set when ok==false
+  // Guest display-list identity propagated by the frontend for opt-in runtime
+  // attribution. Zero means the draw came directly from FIFO or is unknown.
+  std::uint32_t display_list_address = 0;
   PipelineKey pipeline{};
   PixelShaderConstants pixel_constants{}; // S14 TEV color/konst/alpha uniforms
   std::uint32_t vertex_count = 0;

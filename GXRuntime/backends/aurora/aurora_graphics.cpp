@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #if !defined(_WIN32)
 #include <execinfo.h>
@@ -51,6 +52,53 @@ unsigned long long texture_upload_count();
 
 namespace gx_aurora {
 
+namespace {
+
+struct DisplayListAttribution {
+    unsigned long long plans = 0;
+    unsigned long long vertices = 0;
+};
+
+std::unordered_map<std::uint32_t, DisplayListAttribution> g_display_list_frame;
+
+bool display_list_attribution_enabled() {
+    static const bool enabled = std::getenv("DOL_GXCORE_DL_ATTRIBUTION") != nullptr;
+    return enabled;
+}
+
+void report_display_list_attribution(unsigned long long present) {
+    if (!display_list_attribution_enabled())
+        return;
+
+    using Entry = std::pair<std::uint32_t, DisplayListAttribution>;
+    std::vector<Entry> entries(g_display_list_frame.begin(), g_display_list_frame.end());
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.second.plans != b.second.plans)
+            return a.second.plans > b.second.plans;
+        return a.first < b.first;
+    });
+
+    unsigned long long plans = 0;
+    unsigned long long vertices = 0;
+    for (const auto& entry : entries) {
+        plans += entry.second.plans;
+        vertices += entry.second.vertices;
+    }
+    std::fprintf(stderr,
+                 "[gx-dl] present=%llu identities=%zu plans=%llu vertices=%llu\n",
+                 present, entries.size(), plans, vertices);
+    const std::size_t limit = std::min<std::size_t>(entries.size(), 12u);
+    for (std::size_t rank = 0; rank < limit; ++rank) {
+        const auto& [address, totals] = entries[rank];
+        std::fprintf(stderr,
+                     "[gx-dl] present=%llu rank=%zu address=%08X plans=%llu vertices=%llu\n",
+                     present, rank + 1u, address, totals.plans, totals.vertices);
+    }
+    g_display_list_frame.clear();
+}
+
+} // namespace
+
 // True while the FIFO worker translates. Then the worker requests each present
 // itself, once per display copy (wait_for_present), and the copy observer must
 // not: its request, raised mid-parse, led to a second, empty present.
@@ -69,6 +117,11 @@ bool core_efb_copy_epoch(uint32_t address, uint32_t size, uint64_t* epoch) {
 void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
     if (!plan.ok)
         return; // skip reasons are tallied in the sink gap counters
+    if (display_list_attribution_enabled()) {
+        auto& totals = g_display_list_frame[plan.display_list_address];
+        ++totals.plans;
+        totals.vertices += plan.vertex_count;
+    }
     // DOL_GXCORE_PLAN_TEX=<hex guest address>: print the TEV setup of draws
     // that sample that texture (first 12), for comparing a draw with Dolphin.
     static const long long s_plan_tex = [] {
@@ -1475,6 +1528,7 @@ static void aurora_backend_present_impl(void) {
                 c.vertex_decode_failures - s_prev.vertex_decode_failures);
             s_prev = c;
         }
+        gx_aurora::report_display_list_attribution(gx_aurora::g_present_count + 1u);
     }
 #endif
     if (gx_aurora::g_frame_open) {

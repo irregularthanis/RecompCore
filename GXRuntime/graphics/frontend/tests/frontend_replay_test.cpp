@@ -5,6 +5,7 @@
 #include "gxruntime/aurora_recomp/retail_gx_frontend.hpp"
 #include "gxruntime/aurora_recomp/retail_gx_frontend_c.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdint>
@@ -1034,6 +1035,15 @@ int main() {
   assert(saw_kind(sink, RenderPacketKind::State));
   assert(saw_kind(sink, RenderPacketKind::Resource));
   assert(saw_kind(sink, RenderPacketKind::Draw));
+  {
+    const auto draw = std::find_if(
+        sink.packets().begin(), sink.packets().end(),
+        [](const RenderPacket& packet) {
+          return packet.kind == RenderPacketKind::Draw;
+        });
+    assert(draw != sink.packets().end());
+    assert(draw->draw.display_list_address == dl_offset);
+  }
   assert(saw_stream_packet(sink, RenderStreamKind::FifoBytes));
   assert(saw_stream_packet(sink, RenderStreamKind::DisplayList));
   assert(saw_state_packet(sink, RenderStateKind::CpVcd));

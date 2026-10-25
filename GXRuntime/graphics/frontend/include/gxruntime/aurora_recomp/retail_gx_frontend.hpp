@@ -177,10 +177,13 @@ private:
   // own buffer, so the outer vector reallocating during parse does not move the
   // inner heap storage the emitted packets point at.
   std::vector<std::vector<std::uint8_t>> draw_payload_queue_;
+  std::vector<std::uint32_t> draw_display_list_queue_;
   std::vector<DrawTransformSnapshot> draw_transform_queue_;
   std::size_t draw_queue_count_ = 0; // live slots; the vectors keep capacity
   std::size_t draw_payload_head_ = 0;
+  std::size_t draw_display_list_head_ = 0;
   std::size_t draw_transform_head_ = 0;
+  std::uint32_t current_display_list_address_ = 0;
   // The transform version whose arrays scratch_packet_.draw holds (0: none).
   std::uint64_t scratch_transform_version_ = 0;
   void notify_events(std::uint32_t first_event);

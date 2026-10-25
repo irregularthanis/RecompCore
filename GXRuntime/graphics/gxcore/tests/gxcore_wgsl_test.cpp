@@ -127,6 +127,7 @@ void test_state_to_plan_and_wgsl() {
                .aux0 = 2});
 
   ar::ConsumedDraw draw{};
+  draw.display_list_address = 0x80300000u;
   draw.primitive = 0x80; // quads
   draw.vtx_fmt = 0;
   draw.vertex_count = 4;
@@ -199,6 +200,7 @@ void test_state_to_plan_and_wgsl() {
   if (!plan.ok)
     std::fprintf(stderr, "plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);
+  CHECK(plan.display_list_address == draw.display_list_address);
   CHECK(counters.draws_planned == 1);
   CHECK(counters.draws_skipped == 0);
   CHECK(counters.unresolved_tex_matrix == 0);

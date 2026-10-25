@@ -51,6 +51,7 @@ public:
             .element_size = packet.resource.element_size,
         },
         .draw = {
+            .display_list_address = packet.draw.display_list_address,
             .primitive = packet.draw.primitive,
             .vtx_fmt = packet.draw.vtx_fmt,
             .vertex_count = packet.draw.vertex_count,
@@ -485,10 +486,13 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   post_tex_ = PostTexMatrices{};
   fifo_buffer_.clear();
   draw_payload_queue_.clear();
+  draw_display_list_queue_.clear();
   draw_transform_queue_.clear();
   draw_queue_count_ = 0u;
   draw_payload_head_ = 0u;
+  draw_display_list_head_ = 0u;
   draw_transform_head_ = 0u;
+  current_display_list_address_ = 0u;
   scratch_transform_version_ = 0u;
   zero_vertex_draws_ = 0u;
   emitted_trace_count_ = 0u;
@@ -727,9 +731,12 @@ bool RetailGxFrontend::write_display_list(std::span<const std::uint8_t> bytes,
     std::size_t dl_consumed = 0;
     parse_sink_ = packet_drain_enabled_ ? sink : nullptr;
     const bool outer_module_list = in_module_list_;
+    const std::uint32_t outer_display_list = current_display_list_address_;
     in_module_list_ = (guest_address & 0x40000000u) != 0u;
+    current_display_list_address_ = guest_address;
     const bool parsed = parse_stream(bytes, false, false, 1u, &dl_consumed);
     in_module_list_ = outer_module_list;
+    current_display_list_address_ = outer_display_list;
     parse_sink_ = nullptr;
     if (!parsed || dl_consumed != bytes.size()) {
       return false;
@@ -945,12 +952,15 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
 
       std::size_t dl_consumed = 0;
       const bool outer_module_list = in_module_list_;
+      const std::uint32_t outer_display_list = current_display_list_address_;
       in_module_list_ = outer_module_list || (address & 0x40000000u) != 0u;
+      current_display_list_address_ = address;
       const bool list_parsed = parse_stream(
           std::span<const std::uint8_t>{
               static_cast<const std::uint8_t*>(range.data), range.size},
           false, false, depth + 1u, &dl_consumed);
       in_module_list_ = outer_module_list;
+      current_display_list_address_ = outer_display_list;
       if (!list_parsed || dl_consumed != range.size) {
         // A display list that does not parse as GX commands (first met in
         // Wind Waker's Hyrule stage, 2026-09-26) used to fail the whole FIFO,
@@ -1283,6 +1293,10 @@ bool RetailGxFrontend::handle_draw(std::uint8_t command,
     }
     draw_payload_queue_[draw_queue_count_].assign(vertex_data.begin(),
                                                   vertex_data.end());
+    if (draw_queue_count_ == draw_display_list_queue_.size())
+      draw_display_list_queue_.push_back(current_display_list_address_);
+    else
+      draw_display_list_queue_[draw_queue_count_] = current_display_list_address_;
     DrawTransformSnapshot& slot = draw_transform_queue_[draw_queue_count_];
     const DrawTransformSnapshot* previous =
         draw_queue_count_ > 0u ? &draw_transform_queue_[draw_queue_count_ - 1u] : nullptr;
@@ -1366,6 +1380,7 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
       packet.draw = {};
       scratch_transform_version_ = 0u;
     } else if (is_draw || scratch_draw_dirty_) {
+      packet.draw.display_list_address = 0u;
       packet.draw.primitive = 0u;
       packet.draw.vtx_fmt = 0u;
       packet.draw.vertex_count = 0u;
@@ -1385,6 +1400,10 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
       packet.draw.vertex_payload_size =
           static_cast<std::uint32_t>(payload.size());
     }
+    if (packet.kind == RenderPacketKind::Draw &&
+        draw_display_list_head_ < draw_queue_count_)
+      packet.draw.display_list_address =
+          draw_display_list_queue_[draw_display_list_head_++];
     if (packet.kind == RenderPacketKind::Draw &&
         draw_transform_head_ < draw_queue_count_) {
       const DrawTransformSnapshot& transform =
@@ -1485,6 +1504,7 @@ void RetailGxFrontend::drain_emitted_packets(std::uint32_t emitted_count) {
   // queue cannot grow unbounded across a long run.
   draw_queue_count_ = 0u;
   draw_payload_head_ = 0u;
+  draw_display_list_head_ = 0u;
   draw_transform_head_ = 0u;
   if (emitted_count >= state_.trace_count) {
     state_.trace_count = 0u;
