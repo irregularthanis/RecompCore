@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -27,6 +28,16 @@ static int g_failures = 0;
 
 namespace {
 
+ar::RenderStatePacket bp(std::uint32_t reg, std::uint32_t value);
+
+void set_geometry_cache(bool enabled) {
+#ifdef _WIN32
+  _putenv_s("DOL_GXCORE_GEOMETRY_CACHE", enabled ? "1" : "0");
+#else
+  setenv("DOL_GXCORE_GEOMETRY_CACHE", enabled ? "1" : "0", 1);
+#endif
+}
+
 void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
   out.push_back(static_cast<std::uint8_t>(value >> 24));
   out.push_back(static_cast<std::uint8_t>(value >> 16));
@@ -38,6 +49,100 @@ void append_be_f32(std::vector<std::uint8_t>& out, float value) {
   std::uint32_t bits;
   std::memcpy(&bits, &value, sizeof bits);
   append_be32(out, bits);
+}
+
+void test_geometry_cache_contract() {
+  gxc::GxCoreState state;
+  state.reset();
+  state.apply(bp(0x00, 0u));
+  state.apply(bp(0x40, 0x17u));
+  state.apply({.kind = ar::RenderStateKind::CpVcd,
+               .index = 0,
+               .value = (1u << 9)}); // direct position
+  state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 1, .value = 0u});
+  state.apply({.kind = ar::RenderStateKind::CpVat,
+               .index = 0,
+               .value = 1u | (4u << 1),
+               .aux0 = 0}); // XYZ f32
+  state.apply(
+      {.kind = ar::RenderStateKind::CpVat, .index = 0, .value = 0u, .aux0 = 1});
+  state.apply(
+      {.kind = ar::RenderStateKind::CpVat, .index = 0, .value = 0u, .aux0 = 2});
+
+  ar::ConsumedDraw draw{};
+  draw.display_list_address = 0x80379980u;
+  draw.primitive = 0x80u;
+  draw.vertex_count = 4u;
+  draw.vertex_size = 12u;
+  draw.transform_flags = ar::kDrawTransformProjectionValid;
+  draw.projection[0] = draw.projection[2] = 1.f;
+  draw.projection[4] = -1.f;
+  for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
+    append_be_f32(draw.vertex_payload, static_cast<float>(v));
+    append_be_f32(draw.vertex_payload, static_cast<float>(v + 1u));
+    append_be_f32(draw.vertex_payload, 0.f);
+  }
+
+  set_geometry_cache(true);
+  gxc::GapCounters counters;
+  const gxc::DrawPlan first = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan second = state.build_draw_plan(draw, counters);
+  CHECK(first.ok && second.ok);
+  CHECK(first.vertices == second.vertices);
+  CHECK(counters.geometry_cache_misses == 1u);
+  CHECK(counters.geometry_cache_hits == 1u);
+
+  // A guest-visible payload change must not reuse the previous geometry.
+  draw.vertex_payload[3] ^= 1u;
+  const gxc::DrawPlan changed = state.build_draw_plan(draw, counters);
+  CHECK(changed.ok);
+  CHECK(changed.vertices != second.vertices);
+  CHECK(counters.geometry_cache_misses == 2u);
+
+  // Unknown/FIFO identity is deliberately outside the candidate boundary.
+  draw.display_list_address = 0u;
+  CHECK(state.build_draw_plan(draw, counters).ok);
+  CHECK(counters.geometry_cache_bypasses == 1u);
+
+  // Indexed attributes are part of the key by the exact backing bytes read.
+  state.apply({.kind = ar::RenderStateKind::CpVcd,
+               .index = 0,
+               .value = (2u << 9)}); // indexed-8 position
+  std::vector<std::uint8_t> positions;
+  for (std::uint32_t v = 0; v < 4u; ++v) {
+    append_be_f32(positions, static_cast<float>(v));
+    append_be_f32(positions, static_cast<float>(v + 1u));
+    append_be_f32(positions, 0.f);
+  }
+  ar::ConsumedDraw indexed = draw;
+  indexed.display_list_address = 0x8037AAE0u;
+  indexed.vertex_size = 1u;
+  indexed.vertex_payload = {0u, 1u, 2u, 3u};
+  indexed.array_input_count = 1u;
+  indexed.arrays[0].attr = 0u;
+  indexed.arrays[0].base = 0x80400000u;
+  indexed.arrays[0].stride = 12u;
+  indexed.arrays[0].span_size = static_cast<std::uint32_t>(positions.size());
+  indexed.arrays[0].indexed = true;
+  indexed.arrays[0].resolved = true;
+  indexed.arrays[0].host_data = positions.data();
+  indexed.arrays[0].host_available =
+      static_cast<std::uint32_t>(positions.size());
+  indexed.arrays[0].vertex_offset = 0u;
+  indexed.arrays[0].index_size = 1u;
+  indexed.arrays[0].element_size = 12u;
+  const gxc::DrawPlan indexed_first = state.build_draw_plan(indexed, counters);
+  const gxc::DrawPlan indexed_second = state.build_draw_plan(indexed, counters);
+  CHECK(indexed_first.ok && indexed_second.ok);
+  CHECK(indexed_first.vertices == indexed_second.vertices);
+  CHECK(counters.geometry_cache_hits == 2u);
+  positions[3] ^= 1u;
+  const gxc::DrawPlan indexed_changed =
+      state.build_draw_plan(indexed, counters);
+  CHECK(indexed_changed.ok);
+  CHECK(indexed_changed.vertices != indexed_second.vertices);
+  CHECK(counters.geometry_cache_misses == 4u);
+  set_geometry_cache(false);
 }
 
 ar::RenderStatePacket bp(std::uint32_t reg, std::uint32_t value) {
@@ -2211,6 +2316,7 @@ void test_efb_copy_sink() {
 } // namespace
 
 int main() {
+  test_geometry_cache_contract();
   test_state_to_plan_and_wgsl();
   test_truncated_vertex_payload();
   test_untextured_defaults();

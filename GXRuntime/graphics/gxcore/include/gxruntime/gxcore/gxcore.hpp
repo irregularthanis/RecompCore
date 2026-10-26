@@ -43,6 +43,11 @@ struct GapCounters {
   unsigned long long vertex_payload_overrun = 0;
   unsigned long long vertex_array_unresolved = 0;
   unsigned long long vertex_array_out_of_bounds = 0;
+  // Opt-in decoded-geometry cache diagnostics. A bypass is a draw that cannot
+  // be cached safely (unknown display-list identity or unresolved array data).
+  unsigned long long geometry_cache_hits = 0;
+  unsigned long long geometry_cache_misses = 0;
+  unsigned long long geometry_cache_bypasses = 0;
   unsigned long long unsupported_texgen = 0;    // sum of actual texgen gaps below
   unsigned long long texgen_count_overflow = 0; // XF count > captured shader cap
   unsigned long long texgen_count_5 = 0;

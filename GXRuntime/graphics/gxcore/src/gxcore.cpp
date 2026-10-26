@@ -1364,154 +1364,274 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       entry_arrays[e] = find_array(draw, entry.attr);
     entry_scales[e] = 1.f / static_cast<float>(1u << entry.frac);
   }
-  const bool tex_hi_in_nbt = raw_tex_hi_in_nbt(walk);
-  for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
-    float* out_vertex = plan.vertices.data() +
-                        static_cast<std::size_t>(v) * kVertexFloats;
-    // Defaults: color0/1 white, uv 0, posmtx = current matrix's first row.
-    out_vertex[4] = out_vertex[5] = out_vertex[6] = out_vertex[7] = 1.f;
-    out_vertex[8] = out_vertex[9] = out_vertex[10] = out_vertex[11] = 1.f;
-    // NBT part ordinal for index3 (three separate normal/binormal/tangent
-    // entries); a single 9-component entry decodes all three at once.
-    std::uint32_t normal_part = 0;
-    std::uint32_t posmtx_row = draw.current_pn_matrix * 3u;
-    std::uint32_t texmtxidx_packed = 0; // texgens 0..3, one byte each
-    std::uint32_t texmtxidx_packed_hi = 0; // texgens 4..7, one byte each
-    std::size_t offset =
-        static_cast<std::size_t>(v) * walk.vertex_size;
-    for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
-      const WalkEntry& entry = walk.entries[e];
-      if (offset >= payload_size) {
-        ++counters.vertex_decode_failures;
-        ++counters.vertex_payload_overrun;
-        return skip("payload overrun");
-      }
-      const std::uint8_t* p = payload + offset;
-      const std::uint8_t* element = nullptr;
-      std::uint32_t advance = 0;
-      if (entry.kind == WalkEntry::kPosMtxIdx) {
-        posmtx_row = p[0];
-        offset += 1;
-        continue;
-      }
-      if (entry.kind == WalkEntry::kTexMtxIdx) {
-        // GX per-vertex TEXMTXIDX: the byte is a matrix-memory row index (GX
-        // pre-multiplies by 3, same convention as PNMTXIDX). Pack one byte per
-        // texgen so the VS can select transformmatrices[row] per vertex.
-        if (entry.out_slot < 4u) {
-          texmtxidx_packed |= static_cast<std::uint32_t>(p[0])
-                              << (8u * entry.out_slot);
-        } else if (entry.out_slot < 8u) {
-          texmtxidx_packed_hi |= static_cast<std::uint32_t>(p[0])
-                                 << (8u * (entry.out_slot - 4u));
+  // Repeated static display lists commonly decode the same FIFO payload and
+  // indexed guest-array elements hundreds of times per frame. This opt-in
+  // cache reuses only the decoded vertex vector; matrices, lighting, textures,
+  // uniforms and all other draw state remain live. The fingerprint includes
+  // every byte consumed by vertex decoding, so guest writes naturally miss.
+  struct GeometryCacheEntry {
+    std::uint32_t address = 0;
+    std::uint64_t fingerprint = 0;
+    std::vector<float> vertices;
+    bool valid = false;
+  };
+  struct GeometryCache {
+    std::array<GeometryCacheEntry, 256> entries{};
+    unsigned long long hits = 0;
+    unsigned long long misses = 0;
+    unsigned long long bypasses = 0;
+    ~GeometryCache() {
+      if (std::getenv("DOL_GXCORE_OPT_LOG") || hits || misses || bypasses)
+        std::fprintf(stderr,
+                     "[gx-geometry] hits=%llu misses=%llu bypasses=%llu\n",
+                     hits, misses, bypasses);
+    }
+  };
+  static thread_local GeometryCache geometry_cache;
+  const char *geometry_cache_env = std::getenv("DOL_GXCORE_GEOMETRY_CACHE");
+  const bool geometry_cache_enabled =
+      geometry_cache_env != nullptr && geometry_cache_env[0] == '1';
+  auto hash_bytes = [](std::uint64_t hash, const void *bytes,
+                       std::size_t size) {
+    const auto *p = static_cast<const std::uint8_t *>(bytes);
+    for (std::size_t i = 0; i < size; ++i) {
+      hash ^= p[i];
+      hash *= 1099511628211ull;
+    }
+    return hash;
+  };
+  std::uint64_t geometry_fingerprint = 1469598103934665603ull;
+  bool geometry_cacheable =
+      geometry_cache_enabled && draw.display_list_address != 0u;
+  if (geometry_cacheable) {
+    geometry_fingerprint =
+        hash_bytes(geometry_fingerprint, walk_key.data(), sizeof(walk_key));
+    geometry_fingerprint =
+        hash_bytes(geometry_fingerprint, &draw.current_pn_matrix,
+                   sizeof(draw.current_pn_matrix));
+    geometry_fingerprint =
+        hash_bytes(geometry_fingerprint, draw.vertex_payload.data(),
+                   draw.vertex_payload.size());
+    // Hash only indexed elements that this draw actually dereferences. Direct
+    // attributes are already covered by vertex_payload above.
+    for (std::uint32_t v = 0; v < draw.vertex_count && geometry_cacheable;
+         ++v) {
+      std::size_t offset = static_cast<std::size_t>(v) * walk.vertex_size;
+      for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
+        const WalkEntry &walk_entry = walk.entries[e];
+        if (walk_entry.kind == WalkEntry::kPosMtxIdx ||
+            walk_entry.kind == WalkEntry::kTexMtxIdx) {
+          ++offset;
+          continue;
         }
-        offset += 1;
-        continue;
-      }
-      if (entry.vcd_type == 1u) {
-        element = p;
-        advance = entry.element_size;
-      } else {
-        const std::uint32_t idx_size = entry.vcd_type == 2u ? 1u : 2u;
-        const std::uint32_t index = idx_size == 1u ? p[0] : load_be16(p);
-        advance = idx_size;
-        const ar::ConsumedArrayInput* array = entry_arrays[e];
-        if (array == nullptr || !array->resolved ||
-            array->host_data == nullptr) {
-          ++counters.vertex_decode_failures;
-          ++counters.vertex_array_unresolved;
-          return skip("indexed attr has no resolved array");
+        if (walk_entry.vcd_type == 1u) {
+          offset += walk_entry.element_size;
+          continue;
         }
+        const std::uint32_t index_size = walk_entry.vcd_type == 2u ? 1u : 2u;
+        const std::uint8_t *index_bytes = draw.vertex_payload.data() + offset;
+        const std::uint32_t index =
+            index_size == 1u ? index_bytes[0] : load_be16(index_bytes);
+        offset += index_size;
+        const ar::ConsumedArrayInput *array = entry_arrays[e];
         const std::uint64_t element_offset =
-            static_cast<std::uint64_t>(index) * array->stride;
-        if (element_offset + entry.element_size > array->host_available) {
+            array == nullptr
+                ? 0u
+                : static_cast<std::uint64_t>(index) * array->stride;
+        if (array == nullptr || !array->resolved ||
+            array->host_data == nullptr ||
+            element_offset + walk_entry.element_size > array->host_available) {
+          geometry_cacheable = false;
+          break;
+        }
+        geometry_fingerprint =
+            hash_bytes(geometry_fingerprint,
+                       static_cast<const std::uint8_t *>(array->host_data) +
+                           element_offset,
+                       walk_entry.element_size);
+      }
+    }
+  }
+  GeometryCacheEntry *geometry_entry = nullptr;
+  bool geometry_hit = false;
+  if (geometry_cache_enabled && !geometry_cacheable) {
+    ++geometry_cache.bypasses;
+    ++counters.geometry_cache_bypasses;
+  } else if (geometry_cacheable) {
+    geometry_entry =
+        &geometry_cache
+             .entries[(draw.display_list_address ^
+                       static_cast<std::uint32_t>(geometry_fingerprint)) %
+                      geometry_cache.entries.size()];
+    geometry_hit = geometry_entry->valid &&
+                   geometry_entry->address == draw.display_list_address &&
+                   geometry_entry->fingerprint == geometry_fingerprint;
+    if (geometry_hit) {
+      ++geometry_cache.hits;
+      ++counters.geometry_cache_hits;
+    } else {
+      ++geometry_cache.misses;
+      ++counters.geometry_cache_misses;
+    }
+  }
+  const bool tex_hi_in_nbt = raw_tex_hi_in_nbt(walk);
+  if (geometry_hit) {
+    plan.vertices = geometry_entry->vertices;
+  } else {
+    for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
+      float *out_vertex =
+          plan.vertices.data() + static_cast<std::size_t>(v) * kVertexFloats;
+      // Defaults: color0/1 white, uv 0, posmtx = current matrix's first row.
+      out_vertex[4] = out_vertex[5] = out_vertex[6] = out_vertex[7] = 1.f;
+      out_vertex[8] = out_vertex[9] = out_vertex[10] = out_vertex[11] = 1.f;
+      // NBT part ordinal for index3 (three separate normal/binormal/tangent
+      // entries); a single 9-component entry decodes all three at once.
+      std::uint32_t normal_part = 0;
+      std::uint32_t posmtx_row = draw.current_pn_matrix * 3u;
+      std::uint32_t texmtxidx_packed = 0;    // texgens 0..3, one byte each
+      std::uint32_t texmtxidx_packed_hi = 0; // texgens 4..7, one byte each
+      std::size_t offset = static_cast<std::size_t>(v) * walk.vertex_size;
+      for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
+        const WalkEntry &entry = walk.entries[e];
+        if (offset >= payload_size) {
           ++counters.vertex_decode_failures;
-          ++counters.vertex_array_out_of_bounds;
-          return skip("indexed element outside resolved array");
+          ++counters.vertex_payload_overrun;
+          return skip("payload overrun");
         }
-        element =
-            static_cast<const std::uint8_t*>(array->host_data) +
-            element_offset;
-      }
-      offset += advance;
+        const std::uint8_t *p = payload + offset;
+        const std::uint8_t *element = nullptr;
+        std::uint32_t advance = 0;
+        if (entry.kind == WalkEntry::kPosMtxIdx) {
+          posmtx_row = p[0];
+          offset += 1;
+          continue;
+        }
+        if (entry.kind == WalkEntry::kTexMtxIdx) {
+          // GX per-vertex TEXMTXIDX: the byte is a matrix-memory row index (GX
+          // pre-multiplies by 3, same convention as PNMTXIDX). Pack one byte
+          // per texgen so the VS can select transformmatrices[row] per vertex.
+          if (entry.out_slot < 4u) {
+            texmtxidx_packed |= static_cast<std::uint32_t>(p[0])
+                                << (8u * entry.out_slot);
+          } else if (entry.out_slot < 8u) {
+            texmtxidx_packed_hi |= static_cast<std::uint32_t>(p[0])
+                                   << (8u * (entry.out_slot - 4u));
+          }
+          offset += 1;
+          continue;
+        }
+        if (entry.vcd_type == 1u) {
+          element = p;
+          advance = entry.element_size;
+        } else {
+          const std::uint32_t idx_size = entry.vcd_type == 2u ? 1u : 2u;
+          const std::uint32_t index = idx_size == 1u ? p[0] : load_be16(p);
+          advance = idx_size;
+          const ar::ConsumedArrayInput *array = entry_arrays[e];
+          if (array == nullptr || !array->resolved ||
+              array->host_data == nullptr) {
+            ++counters.vertex_decode_failures;
+            ++counters.vertex_array_unresolved;
+            return skip("indexed attr has no resolved array");
+          }
+          const std::uint64_t element_offset =
+              static_cast<std::uint64_t>(index) * array->stride;
+          if (element_offset + entry.element_size > array->host_available) {
+            ++counters.vertex_decode_failures;
+            ++counters.vertex_array_out_of_bounds;
+            return skip("indexed element outside resolved array");
+          }
+          element = static_cast<const std::uint8_t *>(array->host_data) +
+                    element_offset;
+        }
+        offset += advance;
 
-      switch (entry.kind) {
-      case WalkEntry::kPos: {
-        std::uint32_t scalar = 0;
-        component_scalar_size(entry.format, &scalar);
-        const float scale = entry_scales[e];
-        for (std::uint32_t c = 0; c < entry.count && c < 3u; ++c)
-          out_vertex[c] = decode_scaled(element + c * scalar, entry.format, scale);
-        if (entry.count == 2u)
-          out_vertex[2] = 0.f;
-        break;
-      }
-      case WalkEntry::kColor: {
-        float rgba[4];
-        decode_color(element, entry.format, rgba);
-        float* dst = out_vertex + (entry.out_slot == 0u ? 4u : 8u);
-        for (int c = 0; c < 4; ++c)
-          dst[c] = rgba[c];
-        break;
-      }
-      case WalkEntry::kTex: {
-        float* dst = nullptr;
-        if (entry.out_slot < kMaxRawTexCoords) {
-          dst = out_vertex + 12u + 2u * entry.out_slot;
-        } else if (tex_hi_in_nbt && entry.out_slot < 8u) {
-          static constexpr std::uint32_t kHiSlot[3] = {
-              kVertexNormalOffset, kVertexBinormalOffset, kVertexTangentOffset};
-          dst = out_vertex + kHiSlot[entry.out_slot - kMaxRawTexCoords] / 4u;
-        }
-        if (dst != nullptr) {
+        switch (entry.kind) {
+        case WalkEntry::kPos: {
           std::uint32_t scalar = 0;
           component_scalar_size(entry.format, &scalar);
           const float scale = entry_scales[e];
-          dst[0] = decode_scaled(element, entry.format, scale);
-          dst[1] = entry.count == 2u
-                       ? decode_scaled(element + scalar, entry.format, scale)
-                       : 0.f;
+          for (std::uint32_t c = 0; c < entry.count && c < 3u; ++c)
+            out_vertex[c] =
+                decode_scaled(element + c * scalar, entry.format, scale);
+          if (entry.count == 2u)
+            out_vertex[2] = 0.f;
+          break;
         }
-        break;
-      }
-      case WalkEntry::kNormal: {
-        // Normal (+ NBT binormal/tangent for emboss texgens). A single 9-part
-        // entry (direct or non-index3 indexed) holds N,B,T contiguously; index3
-        // arrives as three count==3 entries routed by normal_part.
-        std::uint32_t scalar = 0;
-        component_scalar_size(entry.format, &scalar);
-        const float scale = entry_scales[e];
-        auto decode3 = [&](const std::uint8_t* src, std::uint32_t dst_off) {
-          float* dst = out_vertex + dst_off / 4u;
-          for (std::uint32_t c = 0; c < 3u; ++c)
-            dst[c] = decode_scaled(src + c * scalar, entry.format, scale);
-        };
-        if (entry.count >= 9u) {
-          decode3(element, kVertexNormalOffset);
-          decode3(element + 3u * scalar, kVertexBinormalOffset);
-          decode3(element + 6u * scalar, kVertexTangentOffset);
-          normal_part = 3;
-        } else if (normal_part == 0u) {
-          decode3(element, kVertexNormalOffset);
-          normal_part = 1;
-        } else if (normal_part == 1u) {
-          decode3(element, kVertexBinormalOffset);
-          normal_part = 2;
-        } else if (normal_part == 2u) {
-          decode3(element, kVertexTangentOffset);
-          normal_part = 3;
+        case WalkEntry::kColor: {
+          float rgba[4];
+          decode_color(element, entry.format, rgba);
+          float *dst = out_vertex + (entry.out_slot == 0u ? 4u : 8u);
+          for (int c = 0; c < 4; ++c)
+            dst[c] = rgba[c];
+          break;
         }
-        break;
+        case WalkEntry::kTex: {
+          float *dst = nullptr;
+          if (entry.out_slot < kMaxRawTexCoords) {
+            dst = out_vertex + 12u + 2u * entry.out_slot;
+          } else if (tex_hi_in_nbt && entry.out_slot < 8u) {
+            static constexpr std::uint32_t kHiSlot[3] = {kVertexNormalOffset,
+                                                         kVertexBinormalOffset,
+                                                         kVertexTangentOffset};
+            dst = out_vertex + kHiSlot[entry.out_slot - kMaxRawTexCoords] / 4u;
+          }
+          if (dst != nullptr) {
+            std::uint32_t scalar = 0;
+            component_scalar_size(entry.format, &scalar);
+            const float scale = entry_scales[e];
+            dst[0] = decode_scaled(element, entry.format, scale);
+            dst[1] = entry.count == 2u
+                         ? decode_scaled(element + scalar, entry.format, scale)
+                         : 0.f;
+          }
+          break;
+        }
+        case WalkEntry::kNormal: {
+          // Normal (+ NBT binormal/tangent for emboss texgens). A single 9-part
+          // entry (direct or non-index3 indexed) holds N,B,T contiguously;
+          // index3 arrives as three count==3 entries routed by normal_part.
+          std::uint32_t scalar = 0;
+          component_scalar_size(entry.format, &scalar);
+          const float scale = entry_scales[e];
+          auto decode3 = [&](const std::uint8_t *src, std::uint32_t dst_off) {
+            float *dst = out_vertex + dst_off / 4u;
+            for (std::uint32_t c = 0; c < 3u; ++c)
+              dst[c] = decode_scaled(src + c * scalar, entry.format, scale);
+          };
+          if (entry.count >= 9u) {
+            decode3(element, kVertexNormalOffset);
+            decode3(element + 3u * scalar, kVertexBinormalOffset);
+            decode3(element + 6u * scalar, kVertexTangentOffset);
+            normal_part = 3;
+          } else if (normal_part == 0u) {
+            decode3(element, kVertexNormalOffset);
+            normal_part = 1;
+          } else if (normal_part == 1u) {
+            decode3(element, kVertexBinormalOffset);
+            normal_part = 2;
+          } else if (normal_part == 2u) {
+            decode3(element, kVertexTangentOffset);
+            normal_part = 3;
+          }
+          break;
+        }
+        default:
+          break;
+        }
       }
-      default:
-        break;
-      }
+      std::memcpy(out_vertex + 3, &posmtx_row, sizeof posmtx_row);
+      std::memcpy(out_vertex + kVertexTexMtxIdxOffset / 4u, &texmtxidx_packed,
+                  sizeof texmtxidx_packed);
+      std::memcpy(out_vertex + kVertexTexMtxIdxHiOffset / 4u,
+                  &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
     }
-    std::memcpy(out_vertex + 3, &posmtx_row, sizeof posmtx_row);
-    std::memcpy(out_vertex + kVertexTexMtxIdxOffset / 4u, &texmtxidx_packed,
-                sizeof texmtxidx_packed);
-    std::memcpy(out_vertex + kVertexTexMtxIdxHiOffset / 4u,
-                &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
+  }
+  if (geometry_entry != nullptr && !geometry_hit) {
+    geometry_entry->address = draw.display_list_address;
+    geometry_entry->fingerprint = geometry_fingerprint;
+    geometry_entry->vertices = plan.vertices;
+    geometry_entry->valid = true;
   }
 
   // Uniforms. Most draws are made with the transform state of the draw
