@@ -1383,17 +1383,31 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     unsigned long long hits = 0;
     unsigned long long misses = 0;
     unsigned long long bypasses = 0;
+    unsigned long long conflicts = 0;
+    unsigned long long evictions = 0;
+    unsigned long long hit_vertices = 0;
+    unsigned long long copied_bytes = 0;
+    unsigned long long fifo_payload_bytes_hashed = 0;
+    unsigned long long epoch_queries = 0;
+    unsigned long long indexed_arrays_examined = 0;
     ~GeometryCache() {
       if (std::getenv("DOL_GXCORE_OPT_LOG") || hits || misses || bypasses)
         std::fprintf(stderr,
-                     "[gx-geometry] hits=%llu misses=%llu bypasses=%llu\n",
-                     hits, misses, bypasses);
+                     "[gx-geometry] hits=%llu misses=%llu bypasses=%llu "
+                     "conflicts=%llu evictions=%llu hit_vertices=%llu "
+                     "copied_bytes=%llu fifo_bytes_hashed=%llu "
+                     "epoch_queries=%llu arrays_examined=%llu\n",
+                     hits, misses, bypasses, conflicts, evictions, hit_vertices,
+                     copied_bytes, fifo_payload_bytes_hashed, epoch_queries,
+                     indexed_arrays_examined);
     }
   };
   static thread_local GeometryCache geometry_cache;
   const char *geometry_cache_env = std::getenv("DOL_GXCORE_GEOMETRY_CACHE");
   const bool geometry_cache_enabled =
       geometry_cache_env != nullptr && geometry_cache_env[0] == '1';
+  const bool geometry_diagnostics_enabled =
+      std::getenv("DOL_GXCORE_OPT_LOG") != nullptr;
   auto hash_bytes = [](std::uint64_t hash, const void *bytes,
                        std::size_t size) {
     const auto *p = static_cast<const std::uint8_t *>(bytes);
@@ -1415,11 +1429,20 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     geometry_fingerprint =
         hash_bytes(geometry_fingerprint, draw.vertex_payload.data(),
                    draw.vertex_payload.size());
+    if (geometry_diagnostics_enabled) {
+      geometry_cache.fifo_payload_bytes_hashed += draw.vertex_payload.size();
+      counters.geometry_cache_fifo_payload_bytes_hashed +=
+          draw.vertex_payload.size();
+    }
     std::array<const ar::ConsumedArrayInput *, 24> fingerprinted_arrays{};
     std::size_t fingerprinted_array_count = 0;
     for (std::uint32_t e = 0; e < walk.entry_count && geometry_cacheable; ++e) {
       if (walk.entries[e].vcd_type <= 1u)
         continue;
+      if (geometry_diagnostics_enabled) {
+        ++geometry_cache.indexed_arrays_examined;
+        ++counters.geometry_cache_indexed_arrays_examined;
+      }
       const ar::ConsumedArrayInput *array = entry_arrays[e];
       if (array == nullptr || !array->resolved || array->host_data == nullptr ||
           array->span_size == 0u) {
@@ -1432,6 +1455,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
                                   fingerprinted_array_count)
         continue;
       std::uint64_t dirty_epoch = 0;
+      if (geometry_diagnostics_enabled) {
+        ++geometry_cache.epoch_queries;
+        ++counters.geometry_cache_epoch_queries;
+      }
       if (!dol_guest_memory_dirty_epoch(array->base, array->span_size,
                                         &dirty_epoch)) {
         geometry_cacheable = false;
@@ -1465,9 +1492,22 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     geometry_hit = geometry_entry->valid &&
                    geometry_entry->address == draw.display_list_address &&
                    geometry_entry->fingerprint == geometry_fingerprint;
+    if (geometry_diagnostics_enabled && geometry_entry->valid &&
+        !geometry_hit) {
+      ++geometry_cache.conflicts;
+      ++counters.geometry_cache_conflicts;
+    }
     if (geometry_hit) {
       ++geometry_cache.hits;
       ++counters.geometry_cache_hits;
+      if (geometry_diagnostics_enabled) {
+        geometry_cache.hit_vertices += draw.vertex_count;
+        counters.geometry_cache_hit_vertices += draw.vertex_count;
+        const auto copied_bytes =
+            geometry_entry->vertices.size() * sizeof(float);
+        geometry_cache.copied_bytes += copied_bytes;
+        counters.geometry_cache_copied_bytes += copied_bytes;
+      }
     } else {
       ++geometry_cache.misses;
       ++counters.geometry_cache_misses;
@@ -1627,6 +1667,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     }
   }
   if (geometry_entry != nullptr && !geometry_hit) {
+    if (geometry_diagnostics_enabled && geometry_entry->valid) {
+      ++geometry_cache.evictions;
+      ++counters.geometry_cache_evictions;
+    }
     geometry_entry->address = draw.display_list_address;
     geometry_entry->fingerprint = geometry_fingerprint;
     geometry_entry->vertices = plan.vertices;

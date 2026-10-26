@@ -39,6 +39,17 @@ void set_geometry_cache(bool enabled) {
 #endif
 }
 
+void set_geometry_diagnostics(bool enabled) {
+#ifdef _WIN32
+  _putenv_s("DOL_GXCORE_OPT_LOG", enabled ? "1" : "");
+#else
+  if (enabled)
+    setenv("DOL_GXCORE_OPT_LOG", "1", 1);
+  else
+    unsetenv("DOL_GXCORE_OPT_LOG");
+#endif
+}
+
 void append_be32(std::vector<std::uint8_t>& out, std::uint32_t value) {
   out.push_back(static_cast<std::uint8_t>(value >> 24));
   out.push_back(static_cast<std::uint8_t>(value >> 16));
@@ -86,6 +97,7 @@ void test_geometry_cache_contract() {
   }
 
   set_geometry_cache(true);
+  set_geometry_diagnostics(true);
   gxc::GapCounters counters;
   const gxc::DrawPlan first = state.build_draw_plan(draw, counters);
   const gxc::DrawPlan second = state.build_draw_plan(draw, counters);
@@ -93,6 +105,11 @@ void test_geometry_cache_contract() {
   CHECK(first.vertices == second.vertices);
   CHECK(counters.geometry_cache_misses == 1u);
   CHECK(counters.geometry_cache_hits == 1u);
+  CHECK(counters.geometry_cache_hit_vertices == draw.vertex_count);
+  CHECK(counters.geometry_cache_copied_bytes ==
+        first.vertices.size() * sizeof(float));
+  CHECK(counters.geometry_cache_fifo_payload_bytes_hashed ==
+        draw.vertex_payload.size() * 2u);
 
   // A guest-visible payload change must not reuse the previous geometry.
   draw.vertex_payload[3] ^= 1u;
@@ -140,6 +157,8 @@ void test_geometry_cache_contract() {
   CHECK(indexed_first.ok && indexed_second.ok);
   CHECK(indexed_first.vertices == indexed_second.vertices);
   CHECK(counters.geometry_cache_hits == 2u);
+  CHECK(counters.geometry_cache_epoch_queries == 2u);
+  CHECK(counters.geometry_cache_indexed_arrays_examined == 2u);
   positions[3] ^= 1u;
   dol_guest_memory_dirty_mark(indexed.arrays[0].base,
                               indexed.arrays[0].span_size);
@@ -154,6 +173,7 @@ void test_geometry_cache_contract() {
   indexed.arrays[0].base = 0x82000000u;
   CHECK(state.build_draw_plan(indexed, counters).ok);
   CHECK(counters.geometry_cache_bypasses == 2u);
+  set_geometry_diagnostics(false);
   set_geometry_cache(false);
 }
 

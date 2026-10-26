@@ -48,6 +48,13 @@ struct GapCounters {
   unsigned long long geometry_cache_hits = 0;
   unsigned long long geometry_cache_misses = 0;
   unsigned long long geometry_cache_bypasses = 0;
+  unsigned long long geometry_cache_conflicts = 0;
+  unsigned long long geometry_cache_evictions = 0;
+  unsigned long long geometry_cache_hit_vertices = 0;
+  unsigned long long geometry_cache_copied_bytes = 0;
+  unsigned long long geometry_cache_fifo_payload_bytes_hashed = 0;
+  unsigned long long geometry_cache_epoch_queries = 0;
+  unsigned long long geometry_cache_indexed_arrays_examined = 0;
   unsigned long long unsupported_texgen = 0;    // sum of actual texgen gaps below
   unsigned long long texgen_count_overflow = 0; // XF count > captured shader cap
   unsigned long long texgen_count_5 = 0;
