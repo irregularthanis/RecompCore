@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/gxcore/gxcore.hpp"
 #include "gxruntime/gxcore/shader.hpp"
+#include "gxruntime/guest_memory_dirty.h"
 
 #include <algorithm>
 #include <array>
@@ -1367,8 +1368,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   // Repeated static display lists commonly decode the same FIFO payload and
   // indexed guest-array elements hundreds of times per frame. This opt-in
   // cache reuses only the decoded vertex vector; matrices, lighting, textures,
-  // uniforms and all other draw state remain live. The fingerprint includes
-  // every byte consumed by vertex decoding, so guest writes naturally miss.
+  // uniforms and all other draw state remain live. Direct attributes and array
+  // indices are fingerprinted from the FIFO payload. Indexed-array contents
+  // use the runtime's guest-memory dirty epoch so validation does not rescan
+  // every referenced element on each draw.
   struct GeometryCacheEntry {
     std::uint32_t address = 0;
     std::uint64_t fingerprint = 0;
@@ -1412,44 +1415,40 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     geometry_fingerprint =
         hash_bytes(geometry_fingerprint, draw.vertex_payload.data(),
                    draw.vertex_payload.size());
-    // Hash only indexed elements that this draw actually dereferences. Direct
-    // attributes are already covered by vertex_payload above.
-    for (std::uint32_t v = 0; v < draw.vertex_count && geometry_cacheable;
-         ++v) {
-      std::size_t offset = static_cast<std::size_t>(v) * walk.vertex_size;
-      for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
-        const WalkEntry &walk_entry = walk.entries[e];
-        if (walk_entry.kind == WalkEntry::kPosMtxIdx ||
-            walk_entry.kind == WalkEntry::kTexMtxIdx) {
-          ++offset;
-          continue;
-        }
-        if (walk_entry.vcd_type == 1u) {
-          offset += walk_entry.element_size;
-          continue;
-        }
-        const std::uint32_t index_size = walk_entry.vcd_type == 2u ? 1u : 2u;
-        const std::uint8_t *index_bytes = draw.vertex_payload.data() + offset;
-        const std::uint32_t index =
-            index_size == 1u ? index_bytes[0] : load_be16(index_bytes);
-        offset += index_size;
-        const ar::ConsumedArrayInput *array = entry_arrays[e];
-        const std::uint64_t element_offset =
-            array == nullptr
-                ? 0u
-                : static_cast<std::uint64_t>(index) * array->stride;
-        if (array == nullptr || !array->resolved ||
-            array->host_data == nullptr ||
-            element_offset + walk_entry.element_size > array->host_available) {
-          geometry_cacheable = false;
-          break;
-        }
-        geometry_fingerprint =
-            hash_bytes(geometry_fingerprint,
-                       static_cast<const std::uint8_t *>(array->host_data) +
-                           element_offset,
-                       walk_entry.element_size);
+    std::array<const ar::ConsumedArrayInput *, 24> fingerprinted_arrays{};
+    std::size_t fingerprinted_array_count = 0;
+    for (std::uint32_t e = 0; e < walk.entry_count && geometry_cacheable; ++e) {
+      if (walk.entries[e].vcd_type <= 1u)
+        continue;
+      const ar::ConsumedArrayInput *array = entry_arrays[e];
+      if (array == nullptr || !array->resolved || array->host_data == nullptr ||
+          array->span_size == 0u) {
+        geometry_cacheable = false;
+        break;
       }
+      if (std::find(fingerprinted_arrays.begin(),
+                    fingerprinted_arrays.begin() + fingerprinted_array_count,
+                    array) != fingerprinted_arrays.begin() +
+                                  fingerprinted_array_count)
+        continue;
+      std::uint64_t dirty_epoch = 0;
+      if (!dol_guest_memory_dirty_epoch(array->base, array->span_size,
+                                        &dirty_epoch)) {
+        geometry_cacheable = false;
+        break;
+      }
+      fingerprinted_arrays[fingerprinted_array_count++] = array;
+      geometry_fingerprint =
+          hash_bytes(geometry_fingerprint, &array->attr, sizeof(array->attr));
+      geometry_fingerprint =
+          hash_bytes(geometry_fingerprint, &array->base, sizeof(array->base));
+      geometry_fingerprint = hash_bytes(geometry_fingerprint, &array->stride,
+                                        sizeof(array->stride));
+      geometry_fingerprint =
+          hash_bytes(geometry_fingerprint, &array->span_size,
+                     sizeof(array->span_size));
+      geometry_fingerprint = hash_bytes(geometry_fingerprint, &dirty_epoch,
+                                        sizeof(dirty_epoch));
     }
   }
   GeometryCacheEntry *geometry_entry = nullptr;

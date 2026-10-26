@@ -15,6 +15,8 @@ target_include_directories(gxruntime_gxcore
 target_link_libraries(gxruntime_gxcore
     PUBLIC
         GXRuntime::aurora_render_sink
+    PRIVATE
+        GXRuntime::runtime
 )
 
 if(BUILD_TESTING)

@@ -5,6 +5,7 @@
 // hand-built state, assert bytes.
 
 #include "gxruntime/gxcore/gxcore.hpp"
+#include "gxruntime/guest_memory_dirty.h"
 
 #include <cmath>
 #include <cstdio>
@@ -52,6 +53,7 @@ void append_be_f32(std::vector<std::uint8_t>& out, float value) {
 }
 
 void test_geometry_cache_contract() {
+  dol_guest_memory_dirty_reset();
   gxc::GxCoreState state;
   state.reset();
   state.apply(bp(0x00, 0u));
@@ -104,7 +106,7 @@ void test_geometry_cache_contract() {
   CHECK(state.build_draw_plan(draw, counters).ok);
   CHECK(counters.geometry_cache_bypasses == 1u);
 
-  // Indexed attributes are part of the key by the exact backing bytes read.
+  // Indexed attributes are invalidated through the guest-memory dirty epoch.
   state.apply({.kind = ar::RenderStateKind::CpVcd,
                .index = 0,
                .value = (2u << 9)}); // indexed-8 position
@@ -131,17 +133,27 @@ void test_geometry_cache_contract() {
   indexed.arrays[0].vertex_offset = 0u;
   indexed.arrays[0].index_size = 1u;
   indexed.arrays[0].element_size = 12u;
+  dol_guest_memory_dirty_mark(indexed.arrays[0].base,
+                              indexed.arrays[0].span_size);
   const gxc::DrawPlan indexed_first = state.build_draw_plan(indexed, counters);
   const gxc::DrawPlan indexed_second = state.build_draw_plan(indexed, counters);
   CHECK(indexed_first.ok && indexed_second.ok);
   CHECK(indexed_first.vertices == indexed_second.vertices);
   CHECK(counters.geometry_cache_hits == 2u);
   positions[3] ^= 1u;
+  dol_guest_memory_dirty_mark(indexed.arrays[0].base,
+                              indexed.arrays[0].span_size);
   const gxc::DrawPlan indexed_changed =
       state.build_draw_plan(indexed, counters);
   CHECK(indexed_changed.ok);
   CHECK(indexed_changed.vertices != indexed_second.vertices);
   CHECK(counters.geometry_cache_misses == 4u);
+
+  // An indexed span outside tracked guest memory must bypass rather than
+  // reuse geometry without a reliable invalidation signal.
+  indexed.arrays[0].base = 0x82000000u;
+  CHECK(state.build_draw_plan(indexed, counters).ok);
+  CHECK(counters.geometry_cache_bypasses == 2u);
   set_geometry_cache(false);
 }
 
