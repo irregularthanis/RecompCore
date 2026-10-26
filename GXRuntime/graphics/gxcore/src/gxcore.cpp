@@ -1349,8 +1349,6 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
 
   // Vertex decode to the fixed layout.
   plan.vertex_count = draw.vertex_count;
-  plan.vertices.assign(
-      static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
   // Each indexed entry's array, found once for the draw (it was looked up
@@ -1517,6 +1515,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   if (geometry_hit) {
     plan.vertices = geometry_entry->vertices;
   } else {
+    // Cache hits replace the complete vertex vector below. Defer allocation
+    // and zero-initialization until a miss so the hit path does not first
+    // write the same output range with values that are immediately discarded.
+    plan.vertices.assign(
+        static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
     for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
       float *out_vertex =
           plan.vertices.data() + static_cast<std::size_t>(v) * kVertexFloats;
