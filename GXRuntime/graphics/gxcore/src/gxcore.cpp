@@ -1349,6 +1349,8 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
 
   // Vertex decode to the fixed layout.
   plan.vertex_count = draw.vertex_count;
+  plan.vertices.assign(
+      static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
   // Each indexed entry's array, found once for the draw (it was looked up
@@ -1376,8 +1378,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     std::vector<float> vertices;
     bool valid = false;
   };
+  constexpr std::size_t kGeometryCacheWays = 2;
+  constexpr std::size_t kGeometryCacheSetCount = 128;
   struct GeometryCache {
     std::array<GeometryCacheEntry, 256> entries{};
+    std::array<std::uint8_t, kGeometryCacheSetCount> next_victim{};
     unsigned long long hits = 0;
     unsigned long long misses = 0;
     unsigned long long bypasses = 0;
@@ -1482,16 +1487,40 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     ++geometry_cache.bypasses;
     ++counters.geometry_cache_bypasses;
   } else if (geometry_cacheable) {
-    geometry_entry =
-        &geometry_cache
-             .entries[(draw.display_list_address ^
-                       static_cast<std::uint32_t>(geometry_fingerprint)) %
-                      geometry_cache.entries.size()];
-    geometry_hit = geometry_entry->valid &&
-                   geometry_entry->address == draw.display_list_address &&
-                   geometry_entry->fingerprint == geometry_fingerprint;
-    if (geometry_diagnostics_enabled && geometry_entry->valid &&
-        !geometry_hit) {
+    const std::size_t set_index =
+        (draw.display_list_address ^
+         static_cast<std::uint32_t>(geometry_fingerprint)) %
+        kGeometryCacheSetCount;
+    const std::size_t set_begin = set_index * kGeometryCacheWays;
+    bool set_occupied = false;
+    for (std::size_t way = 0; way < kGeometryCacheWays; ++way) {
+      GeometryCacheEntry &candidate =
+          geometry_cache.entries[set_begin + way];
+      set_occupied |= candidate.valid;
+      if (candidate.valid && candidate.address == draw.display_list_address &&
+          candidate.fingerprint == geometry_fingerprint) {
+        geometry_entry = &candidate;
+        geometry_hit = true;
+        geometry_cache.next_victim[set_index] =
+            static_cast<std::uint8_t>(way ^ 1u);
+        break;
+      }
+    }
+    if (!geometry_hit) {
+      std::size_t victim_way = kGeometryCacheWays;
+      for (std::size_t way = 0; way < kGeometryCacheWays; ++way) {
+        if (!geometry_cache.entries[set_begin + way].valid) {
+          victim_way = way;
+          break;
+        }
+      }
+      if (victim_way == kGeometryCacheWays)
+        victim_way = geometry_cache.next_victim[set_index];
+      geometry_entry = &geometry_cache.entries[set_begin + victim_way];
+      geometry_cache.next_victim[set_index] =
+          static_cast<std::uint8_t>(victim_way ^ 1u);
+    }
+    if (geometry_diagnostics_enabled && set_occupied && !geometry_hit) {
       ++geometry_cache.conflicts;
       ++counters.geometry_cache_conflicts;
     }
@@ -1515,11 +1544,6 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   if (geometry_hit) {
     plan.vertices = geometry_entry->vertices;
   } else {
-    // Cache hits replace the complete vertex vector below. Defer allocation
-    // and zero-initialization until a miss so the hit path does not first
-    // write the same output range with values that are immediately discarded.
-    plan.vertices.assign(
-        static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
     for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
       float *out_vertex =
           plan.vertices.data() + static_cast<std::size_t>(v) * kVertexFloats;
