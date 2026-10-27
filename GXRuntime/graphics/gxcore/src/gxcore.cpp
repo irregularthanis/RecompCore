@@ -1383,8 +1383,12 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     std::uint64_t fingerprint = 0;
     bool valid = false;
   };
+  constexpr std::size_t kGeometryCacheWays = 2;
+  constexpr std::size_t kGeometryCacheSetCount = 256;
   struct GeometryCache {
-    std::array<GeometryCacheEntry, 256> entries{};
+    std::array<GeometryCacheEntry,
+               kGeometryCacheWays * kGeometryCacheSetCount> entries{};
+    std::array<std::uint8_t, kGeometryCacheSetCount> next_victim{};
     std::array<GeometryCacheTag, 256> shadow_direct_256{};
     std::array<GeometryCacheTag, 512> shadow_direct_512{};
     std::array<GeometryCacheTag, 256> shadow_two_way_256{};
@@ -1581,25 +1585,53 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
                       geometry_cache.shadow_two_way_512_misses);
     }
 
-    const std::size_t entry_index =
+    const std::size_t set_index =
         (draw.display_list_address ^
          static_cast<std::uint32_t>(geometry_fingerprint)) %
-        geometry_cache.entries.size();
-    geometry_entry = &geometry_cache.entries[entry_index];
-    geometry_hit = geometry_entry->valid &&
-                   geometry_entry->address == draw.display_list_address &&
-                   geometry_entry->fingerprint == geometry_fingerprint;
+        kGeometryCacheSetCount;
+    const std::size_t set_begin = set_index * kGeometryCacheWays;
+    bool set_occupied = false;
+    bool same_address = false;
+    for (std::size_t way = 0; way < kGeometryCacheWays; ++way) {
+      GeometryCacheEntry &candidate =
+          geometry_cache.entries[set_begin + way];
+      set_occupied |= candidate.valid;
+      same_address |= candidate.valid &&
+                      candidate.address == draw.display_list_address;
+      if (candidate.valid &&
+          candidate.address == draw.display_list_address &&
+          candidate.fingerprint == geometry_fingerprint) {
+        geometry_entry = &candidate;
+        geometry_hit = true;
+        geometry_cache.next_victim[set_index] =
+            static_cast<std::uint8_t>(way ^ 1u);
+        break;
+      }
+    }
+    if (!geometry_hit) {
+      std::size_t victim_way = kGeometryCacheWays;
+      for (std::size_t way = 0; way < kGeometryCacheWays; ++way) {
+        if (!geometry_cache.entries[set_begin + way].valid) {
+          victim_way = way;
+          break;
+        }
+      }
+      if (victim_way == kGeometryCacheWays)
+        victim_way = geometry_cache.next_victim[set_index];
+      geometry_entry = &geometry_cache.entries[set_begin + victim_way];
+      geometry_cache.next_victim[set_index] =
+          static_cast<std::uint8_t>(victim_way ^ 1u);
+    }
     if (geometry_diagnostics_enabled && !geometry_hit) {
-      if (!geometry_entry->valid) {
+      if (!set_occupied) {
         ++geometry_cache.miss_empty;
-      } else if (geometry_entry->address == draw.display_list_address) {
+      } else if (same_address) {
         ++geometry_cache.miss_same_address;
       } else {
         ++geometry_cache.miss_different_address;
       }
     }
-    if (geometry_diagnostics_enabled && geometry_entry->valid &&
-        !geometry_hit) {
+    if (geometry_diagnostics_enabled && set_occupied && !geometry_hit) {
       ++geometry_cache.conflicts;
       ++counters.geometry_cache_conflicts;
     }

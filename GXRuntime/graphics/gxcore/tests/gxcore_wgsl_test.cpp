@@ -123,8 +123,9 @@ void test_geometry_cache_contract() {
   CHECK(state.build_draw_plan(draw, counters).ok);
   CHECK(counters.geometry_cache_bypasses == 1u);
 
-  // The production cache remains direct-mapped while diagnostics shadow
-  // alternative layouts. Addresses separated by 256 exercise one collision.
+  // Two identities that map to the same production set must coexist.
+  // Addresses separated by the 256-set count retain the same low index for
+  // an unchanged fingerprint.
   draw.display_list_address = 0x80379980u;
   ar::ConsumedDraw colliding = draw;
   colliding.display_list_address += 256u;
@@ -133,8 +134,19 @@ void test_geometry_cache_contract() {
   CHECK(state.build_draw_plan(draw, counters).ok);
   CHECK(state.build_draw_plan(colliding, counters).ok);
   CHECK(state.build_draw_plan(draw, counters).ok);
-  CHECK(counters.geometry_cache_hits == hits_before_collision + 1u);
-  CHECK(counters.geometry_cache_misses == misses_before_collision + 2u);
+  CHECK(counters.geometry_cache_hits == hits_before_collision + 2u);
+  CHECK(counters.geometry_cache_misses == misses_before_collision + 1u);
+
+  // A third identity in the same set exercises deterministic replacement.
+  // The most recently used first identity remains available after the other
+  // way is selected as the next victim.
+  ar::ConsumedDraw third = draw;
+  third.display_list_address += 512u;
+  const auto evictions_before_third = counters.geometry_cache_evictions;
+  CHECK(state.build_draw_plan(third, counters).ok);
+  CHECK(counters.geometry_cache_evictions == evictions_before_third + 1u);
+  CHECK(state.build_draw_plan(draw, counters).ok);
+  CHECK(counters.geometry_cache_hits == hits_before_collision + 3u);
 
   // Indexed attributes are invalidated through the guest-memory dirty epoch.
   state.apply({.kind = ar::RenderStateKind::CpVcd,
@@ -169,7 +181,7 @@ void test_geometry_cache_contract() {
   const gxc::DrawPlan indexed_second = state.build_draw_plan(indexed, counters);
   CHECK(indexed_first.ok && indexed_second.ok);
   CHECK(indexed_first.vertices == indexed_second.vertices);
-  CHECK(counters.geometry_cache_hits == 3u);
+  CHECK(counters.geometry_cache_hits == 5u);
   CHECK(counters.geometry_cache_epoch_queries == 2u);
   CHECK(counters.geometry_cache_indexed_arrays_examined == 2u);
   positions[3] ^= 1u;
