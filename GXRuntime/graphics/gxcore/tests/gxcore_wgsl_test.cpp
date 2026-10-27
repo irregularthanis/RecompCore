@@ -123,19 +123,18 @@ void test_geometry_cache_contract() {
   CHECK(state.build_draw_plan(draw, counters).ok);
   CHECK(counters.geometry_cache_bypasses == 1u);
 
-  // Two identities that map to the same set must coexist. Addresses that
-  // differ by the set count retain the same low index for an unchanged
-  // fingerprint.
+  // The production cache remains direct-mapped while diagnostics shadow
+  // alternative layouts. Addresses separated by 256 exercise one collision.
   draw.display_list_address = 0x80379980u;
   ar::ConsumedDraw colliding = draw;
-  colliding.display_list_address += 128u;
+  colliding.display_list_address += 256u;
   const auto hits_before_collision = counters.geometry_cache_hits;
   const auto misses_before_collision = counters.geometry_cache_misses;
   CHECK(state.build_draw_plan(draw, counters).ok);
   CHECK(state.build_draw_plan(colliding, counters).ok);
   CHECK(state.build_draw_plan(draw, counters).ok);
-  CHECK(counters.geometry_cache_hits == hits_before_collision + 2u);
-  CHECK(counters.geometry_cache_misses == misses_before_collision + 1u);
+  CHECK(counters.geometry_cache_hits == hits_before_collision + 1u);
+  CHECK(counters.geometry_cache_misses == misses_before_collision + 2u);
 
   // Indexed attributes are invalidated through the guest-memory dirty epoch.
   state.apply({.kind = ar::RenderStateKind::CpVcd,
@@ -170,7 +169,7 @@ void test_geometry_cache_contract() {
   const gxc::DrawPlan indexed_second = state.build_draw_plan(indexed, counters);
   CHECK(indexed_first.ok && indexed_second.ok);
   CHECK(indexed_first.vertices == indexed_second.vertices);
-  CHECK(counters.geometry_cache_hits == 4u);
+  CHECK(counters.geometry_cache_hits == 3u);
   CHECK(counters.geometry_cache_epoch_queries == 2u);
   CHECK(counters.geometry_cache_indexed_arrays_examined == 2u);
   positions[3] ^= 1u;
@@ -180,7 +179,7 @@ void test_geometry_cache_contract() {
       state.build_draw_plan(indexed, counters);
   CHECK(indexed_changed.ok);
   CHECK(indexed_changed.vertices != indexed_second.vertices);
-  CHECK(counters.geometry_cache_misses == 5u);
+  CHECK(counters.geometry_cache_misses == 6u);
 
   // An indexed span outside tracked guest memory must bypass rather than
   // reuse geometry without a reliable invalidation signal.
